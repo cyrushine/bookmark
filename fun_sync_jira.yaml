@@ -1,0 +1,93 @@
+name: 'Sync github issues to jira'
+inputs:
+  webhook-url:
+    description: >
+      Jira integration webhook URL.
+      Store it as a secret as anyone who has access to it will be able to post to your Jira board.
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    #- name: Dump GitHub context
+    #  run: echo '${{ toJSON(github) }}'
+    #  shell: bash
+    - name: restrict action to issues
+      run: |
+        set -eux
+
+        echo "NeedsJiraUpdate=false" >> $GITHUB_ENV
+
+        if [ ${{ github.event_name }} != "issues" ]; then
+          echo "This action only work on issue events. Please use on: issues to use this action."
+          exit 1
+        fi
+
+        if [ ${{ github.event.issue.pull_request }} ]; then
+          echo "This action only work on issues, not pull requests."
+          exit 0
+        fi
+
+        # last one wins
+        echo "NeedsJiraUpdate=true" >> $GITHUB_ENV
+      shell: bash
+
+    - name: "Update jira"
+      if: ${{ env.NeedsJiraUpdate == 'true' }}
+      env:
+        # ID is the html url to keep a link between systems as there is no way to force an ID on Jira side.
+        id: ${{ github.event.issue.html_url }}
+        title: ${{ github.event.issue.title }}
+        body: ${{ github.event.issue.body }}
+        author: ${{ github.event.issue.user.login }}
+      run: |
+        set -eux
+
+        # Convert markdown to JIRA using mistletoe package which is available starting with impish.
+        # Since GH runners only have LTS versions it's safe to only check for focal which doesn't have the package.
+        if [ $(lsb_release -c -s) == "focal" ]; then
+          echo "Converting Markdown to JIRA is only possible starting with Ubuntu 22.04 (jammy). Pushing verbatim content to JIRA..."
+        else
+          TMPDIR=$(mktemp -d)
+          trap 'rm -rf -- "$TMPDIR"' EXIT
+
+          sudo apt install -y python3-mistletoe
+          echo ${body} > $TMPDIR/body.md
+          body=$(PYTHONPATH=/usr/share/doc/python3-mistletoe mistletoe -r examples.jira_renderer.JIRARenderer $TMPDIR/body.md)
+        fi
+
+        description="${body}
+
+        Opened by ${author}."
+
+        # Choose Jira action based on event type and action.
+        action=""
+        if [ ${{ github.event_name }} == "issues" ]; then
+          action=Update
+          if [ ${{ github.event.action }} == "opened" ]; then
+            action=Create
+          elif [ ${{ github.event.action }} == "reopened" ]; then
+            action=Reopen
+          elif [ ${{ github.event.action }} == "deleted" ]; then
+            # Note: deleting issue from GH is not supported ATM as there is no more label attached. unlabeled is supported.
+            action=Delete
+          elif [ ${{ github.event.action }} == "closed" ]; then
+            action=Close
+          fi
+        else
+          echo "Deleting comment on Jira is not supported ATM, skipping."
+          exit 0
+        fi
+
+        echo "PUSHING: $id $action $title $description"
+
+        # Push to Jira as a json data format.
+        data=$(jq -n \
+                  --arg id "$id" \
+                  --arg action "$action" \
+                  --arg title "$title" \
+                  --arg description "$description" \
+                  '{data: {id: $id, action: $action, title: $title, description: $description}}')
+        curl -X POST -H 'Content-type: application/json' --data "${data}" '${{ inputs.webhook-url }}'
+
+      shell: bash
